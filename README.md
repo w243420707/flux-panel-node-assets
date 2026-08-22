@@ -35,6 +35,10 @@ curl -L https://raw.githubusercontent.com/w243420707/flux-panel-node-assets/refs
 
 ## 更新日志
 
+### 1.0.2 - 2026-08-22
+
+- 安装脚本增加 GitHub/本地资源来源模式，节点更新时会沿用安装时的选择。
+
 ### 1.0.1 - 2026-08-22
 
 - 增加双仓库同步维护规则，避免节点端修改只更新主仓库。
