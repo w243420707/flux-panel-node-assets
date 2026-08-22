@@ -28,7 +28,7 @@ curl -L https://raw.githubusercontent.com/w243420707/flux-panel-node-assets/refs
 
 ## 更新日志
 
-### 1.0.0 - 2026-08-23
+### 1.0.0 - 2026-08-22
 
 - 首次独立发布节点资源仓库。
 - 节点安装脚本默认优先使用本仓库资源，保留面板资源作为兜底。
