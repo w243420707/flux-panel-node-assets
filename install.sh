@@ -1,0 +1,712 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+APP_NAME="gost"
+INSTALL_DIR="/etc/gost"
+LOG_DIR="/var/log/gost"
+LOG_FILE="${LOG_DIR}/gost.log"
+SERVICE_FILE="/etc/systemd/system/gost.service"
+LOGROTATE_FILE="/etc/logrotate.d/gost"
+BINARY_SOURCE_FILE="${INSTALL_DIR}/source.conf"
+DEFAULT_BINARY_BASE_URL="${GOST_DEFAULT_BINARY_BASE_URL:-https://raw.githubusercontent.com/w243420707/flux-panel-node-assets/refs/heads/main/releases}"
+BINARY_BASE_URL="${GOST_BINARY_BASE_URL:-}"
+BINARY_FALLBACK_BASE_URL="${GOST_BINARY_FALLBACK_BASE_URL:-}"
+
+ACTION=""
+SERVER_ADDR=""
+SECRET=""
+ASSUME_YES=0
+ARCH=""
+PKG_MANAGER=""
+OS_ID=""
+OS_VERSION=""
+OS_PRETTY=""
+KERNEL_RELEASE=""
+INIT_SYSTEM=""
+VIRT_TYPE=""
+
+log() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*"; }
+err() { printf '[ERR ] %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+usage() {
+  cat <<EOF
+${APP_NAME} node installer
+
+Usage:
+  sudo bash install.sh [action] [options]
+
+Actions:
+  install     Install or reinstall the node
+  update      Download the latest binary and restart the service
+  uninstall   Stop and remove the node
+  status      Show service status
+  logs        Follow service logs
+  menu        Interactive menu (default)
+
+Options:
+  -a, --addr ADDR    Panel/server address
+  -s, --secret KEY   Node secret
+  -b, --binary-base-url URL
+                     Primary URL serving node releases
+  -f, --fallback-binary-base-url URL
+                     Fallback URL serving node releases
+  -y, --yes         Non-interactive yes for confirmations
+  -h, --help        Show this help
+
+Binary source:
+  ${BINARY_BASE_URL:-not configured}/gost-linux-\${ARCH}
+
+Supported Linux architectures:
+  amd64, arm64, armv7, armv6
+EOF
+}
+
+ensure_root() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo -E bash "$0" "$@"
+  fi
+  die "Please run this script as root."
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ "${ASSUME_YES}" -eq 1 ]]; then
+    return 0
+  fi
+  read -r -p "${prompt} [y/N]: " answer
+  case "${answer}" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_os() {
+  [[ "$(uname -s)" == "Linux" ]] || die "This installer supports Linux only."
+  KERNEL_RELEASE="$(uname -r)"
+
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION="${VERSION_ID:-unknown}"
+    OS_PRETTY="${PRETTY_NAME:-$ID $VERSION_ID}"
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt-get"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"
+  elif command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+  elif command -v pacman >/dev/null 2>&1; then
+    PKG_MANAGER="pacman"
+  elif command -v zypper >/dev/null 2>&1; then
+    PKG_MANAGER="zypper"
+  else
+    PKG_MANAGER=""
+  fi
+
+  [[ -n "${PKG_MANAGER}" ]] || die "No supported package manager found."
+
+  if [[ -d /run/systemd/system ]]; then
+    INIT_SYSTEM="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    INIT_SYSTEM="openrc"
+  else
+    INIT_SYSTEM="unknown"
+  fi
+
+  case "$(uname -m)" in
+    x86_64|amd64|x64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    armv8l|armv7l|armv7|armv7hl|armhf) ARCH="armv7" ;;
+    armv6l|armv6|armel) ARCH="armv6" ;;
+    *)
+      die "Unsupported architecture: $(uname -m). Supported: amd64, arm64, armv7, armv6."
+      ;;
+  esac
+
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    VIRT_TYPE="$(systemd-detect-virt 2>/dev/null || true)"
+    [[ -n "${VIRT_TYPE}" && "${VIRT_TYPE}" != "none" ]] || VIRT_TYPE="bare-metal"
+  else
+    VIRT_TYPE="unknown"
+  fi
+
+  log "Detected OS: ${OS_PRETTY:-unknown}"
+  log "Detected kernel: ${KERNEL_RELEASE}"
+  log "Detected init system: ${INIT_SYSTEM}"
+  log "Detected package manager: ${PKG_MANAGER}"
+  log "Detected environment: ${VIRT_TYPE}"
+  log "Detected architecture: ${ARCH} (from $(uname -m))"
+}
+
+install_packages() {
+  if command -v curl >/dev/null 2>&1 && command -v logrotate >/dev/null 2>&1 && [[ "${INIT_SYSTEM}" == "systemd" ]]; then
+    return 0
+  fi
+
+  log "Installing required packages..."
+  case "${PKG_MANAGER}" in
+    apt-get)
+      apt-get update
+      apt-get install -y curl ca-certificates logrotate
+      ;;
+    dnf)
+      dnf install -y curl ca-certificates logrotate
+      ;;
+    yum)
+      yum install -y curl ca-certificates logrotate
+      ;;
+    apk)
+      apk add --no-cache curl ca-certificates logrotate
+      ;;
+    pacman)
+      pacman -Sy --noconfirm curl ca-certificates logrotate
+      ;;
+    zypper)
+      zypper --non-interactive install curl ca-certificates logrotate
+      ;;
+  esac
+
+  [[ "${INIT_SYSTEM}" == "systemd" ]] || die "systemd is required for this installer. Detected init system: ${INIT_SYSTEM}."
+}
+
+binary_name() {
+  printf 'gost-linux-%s' "${ARCH}"
+}
+
+binary_url() {
+  if [[ -n "${GOST_BINARY_URL:-}" ]]; then
+    printf '%s' "${GOST_BINARY_URL}"
+    return 0
+  fi
+  [[ -n "${BINARY_BASE_URL}" ]] || die "No node binary source configured. Use -b/--binary-base-url or run the installer from the panel."
+  printf '%s/%s' "${BINARY_BASE_URL%/}" "$(binary_name)"
+}
+
+binary_url_for_base() {
+  local base_url="${1:-}"
+  if [[ -n "${GOST_BINARY_URL:-}" ]]; then
+    printf '%s' "${GOST_BINARY_URL}"
+    return 0
+  fi
+  [[ -n "${base_url}" ]] || return 1
+  printf '%s/%s' "${base_url%/}" "$(binary_name)"
+}
+
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+normalize_base_url() {
+  local source
+  source="$(trim_whitespace "${1:-}")"
+  if [[ -z "${source}" ]]; then
+    printf ''
+    return 0
+  fi
+
+  case "${source}" in
+    http://*|https://*)
+      printf '%s' "${source%/}"
+      ;;
+    ws://*)
+      printf 'http://%s' "${source#ws://}"
+      ;;
+    wss://*)
+      printf 'https://%s' "${source#wss://}"
+      ;;
+    *)
+      printf 'https://%s' "${source#/}"
+      ;;
+  esac
+}
+
+derive_binary_base_url() {
+  local source
+  source="$(normalize_base_url "${1:-}")"
+  [[ -n "${source}" ]] || return 1
+  printf '%s/node/releases' "${source%/}"
+}
+
+load_binary_source() {
+  if [[ -n "${GOST_BINARY_BASE_URL:-}" ]]; then
+    BINARY_BASE_URL="${GOST_BINARY_BASE_URL}"
+    BINARY_FALLBACK_BASE_URL="${GOST_BINARY_FALLBACK_BASE_URL:-${BINARY_FALLBACK_BASE_URL}}"
+  elif [[ -z "${BINARY_BASE_URL}" && -f "${BINARY_SOURCE_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    . "${BINARY_SOURCE_FILE}"
+  fi
+  BINARY_BASE_URL="$(normalize_base_url "${BINARY_BASE_URL}")"
+}
+
+read_config_value() {
+  local key="$1" file="$2"
+  [[ -f "${file}" ]] || return 1
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "${file}" | head -n 1
+}
+
+resolve_binary_source() {
+  if [[ -n "${GOST_BINARY_URL:-}" ]]; then
+    return 0
+  fi
+
+  if [[ -z "${BINARY_BASE_URL}" ]]; then
+    load_binary_source
+  fi
+
+  if [[ -z "${BINARY_BASE_URL}" && -n "${SERVER_ADDR:-}" ]]; then
+    BINARY_BASE_URL="$(derive_binary_base_url "${SERVER_ADDR}")"
+  fi
+
+  if [[ -z "${BINARY_BASE_URL}" ]]; then
+    local saved_addr
+    saved_addr="$(read_config_value "addr" "${INSTALL_DIR}/config.json" 2>/dev/null || true)"
+    if [[ -n "${saved_addr}" ]]; then
+      BINARY_BASE_URL="$(derive_binary_base_url "${saved_addr}")"
+    fi
+  fi
+
+  # Older installations saved the panel URL. Promote them to the public asset
+  # repository while keeping the panel URL as a fallback for this update.
+  if [[ -n "${BINARY_BASE_URL}" && -z "${BINARY_FALLBACK_BASE_URL}" && "${BINARY_BASE_URL}" == */node/releases ]]; then
+    BINARY_FALLBACK_BASE_URL="${BINARY_BASE_URL}"
+    BINARY_BASE_URL="${DEFAULT_BINARY_BASE_URL}"
+  fi
+
+  if [[ -z "${BINARY_BASE_URL}" ]]; then
+    BINARY_BASE_URL="${DEFAULT_BINARY_BASE_URL}"
+  fi
+  BINARY_BASE_URL="$(normalize_base_url "${BINARY_BASE_URL}")"
+  BINARY_FALLBACK_BASE_URL="$(normalize_base_url "${BINARY_FALLBACK_BASE_URL}")"
+  write_binary_source
+}
+
+write_binary_source() {
+  [[ -n "${BINARY_BASE_URL}" ]] || return 0
+  mkdir -p "${INSTALL_DIR}"
+  {
+    printf 'BINARY_BASE_URL=%q\n' "${BINARY_BASE_URL%/}"
+    printf 'BINARY_FALLBACK_BASE_URL=%q\n' "${BINARY_FALLBACK_BASE_URL%/}"
+  } > "${BINARY_SOURCE_FILE}"
+  chmod 600 "${BINARY_SOURCE_FILE}"
+}
+
+prompt_config() {
+  if [[ -z "${SERVER_ADDR}" ]]; then
+    read -r -p "Panel/server address: " SERVER_ADDR
+  fi
+  if [[ -z "${SECRET}" ]]; then
+    read -r -p "Node secret: " SECRET
+  fi
+  [[ -n "${SERVER_ADDR}" && -n "${SECRET}" ]] || die "Address and secret are required."
+}
+
+stop_service() {
+  systemctl stop "${APP_NAME}" >/dev/null 2>&1 || true
+}
+
+disable_service() {
+  systemctl disable "${APP_NAME}" >/dev/null 2>&1 || true
+}
+
+write_config() {
+  mkdir -p "${INSTALL_DIR}"
+  cat > "${INSTALL_DIR}/config.json" <<EOF
+{
+  "addr": "${SERVER_ADDR}",
+  "secret": "${SECRET}"
+}
+EOF
+  chmod 600 "${INSTALL_DIR}/config.json"
+
+  if [[ ! -f "${INSTALL_DIR}/gost.json" ]]; then
+    printf '{}\n' > "${INSTALL_DIR}/gost.json"
+    chmod 600 "${INSTALL_DIR}/gost.json"
+  fi
+}
+
+download_binary() {
+  mkdir -p "${INSTALL_DIR}"
+  local primary_url fallback_url tmp_file selected_base
+  tmp_file="$(mktemp)"
+
+  primary_url="$(binary_url_for_base "${BINARY_BASE_URL}")"
+  fallback_url="$(binary_url_for_base "${BINARY_FALLBACK_BASE_URL}")"
+
+  log "Downloading node binary from: ${primary_url}"
+  if download_url_with_ipv4_fallback "${primary_url}" "${tmp_file}"; then
+    selected_base="${BINARY_BASE_URL}"
+  elif [[ -n "${BINARY_FALLBACK_BASE_URL}" && "${BINARY_FALLBACK_BASE_URL}" != "${BINARY_BASE_URL}" ]]; then
+    warn "Primary node asset source failed; trying fallback: ${fallback_url}"
+    rm -f "${tmp_file}"
+    tmp_file="$(mktemp)"
+    download_url_with_ipv4_fallback "${fallback_url}" "${tmp_file}" || {
+      rm -f "${tmp_file}"
+      die "Download failed from both node asset sources."
+    }
+    selected_base="${BINARY_FALLBACK_BASE_URL}"
+  else
+    rm -f "${tmp_file}"
+    die "Download failed. Make sure the node asset repository or panel /node/releases/ is reachable."
+  fi
+
+  chmod 755 "${tmp_file}"
+  verify_binary_checksum "${tmp_file}" "$(binary_name)" "${selected_base}" || {
+    rm -f "${tmp_file}"
+    die "Checksum verification failed for $(binary_name)."
+  }
+  verify_binary "${tmp_file}" || {
+    rm -f "${tmp_file}"
+    die "Downloaded node binary failed validation."
+  }
+  install -m 755 "${tmp_file}" "${INSTALL_DIR}/${APP_NAME}"
+  rm -f "${tmp_file}"
+}
+
+verify_binary_checksum() {
+  local bin="$1" manifest_name="${2:-$(basename "$1")}" base_url="${3:-${BINARY_BASE_URL}}"
+  local manifest_url manifest_file expected actual
+
+  if [[ -n "${GOST_BINARY_URL:-}" ]]; then
+    warn "Custom binary URL detected; skipped repository checksum verification."
+    return 0
+  fi
+
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    warn "Cannot find sha256sum; skipped checksum verification."
+    return 0
+  fi
+
+  [[ -n "${base_url}" ]] || return 1
+  manifest_url="${base_url%/}/SHA256SUMS"
+  manifest_file="$(mktemp)"
+  if ! download_url_with_ipv4_fallback "${manifest_url}" "${manifest_file}"; then
+    rm -f "${manifest_file}"
+    warn "Checksum manifest not found; skipped checksum verification."
+    return 0
+  fi
+
+  expected="$(awk -v name="${manifest_name}" '$2 == name {print $1; exit}' "${manifest_file}")"
+  rm -f "${manifest_file}"
+
+  if [[ -z "${expected}" ]]; then
+    warn "Checksum manifest does not include ${manifest_name}; skipped checksum verification."
+    return 0
+  fi
+
+  actual="$(sha256sum "${bin}" | awk '{print $1}')"
+  [[ "${actual}" == "${expected}" ]] || return 1
+  log "Binary checksum verification passed."
+}
+
+download_url() {
+  local url="$1" destination="$2" force_ipv4="${3:-0}"
+  local -a curl_args=(
+    --fail
+    --silent
+    --show-error
+    --location
+    --retry 3
+    --retry-delay 2
+    --connect-timeout 10
+    --max-time 180
+  )
+  if [[ "${force_ipv4}" == "1" ]]; then
+    curl_args+=(--ipv4)
+  fi
+  curl "${curl_args[@]}" "${url}" -o "${destination}"
+}
+
+download_url_with_ipv4_fallback() {
+  local url="$1" destination="$2"
+  if download_url "${url}" "${destination}" 0; then
+    return 0
+  fi
+
+  warn "Default network path failed; retrying over IPv4: ${url}"
+  download_url "${url}" "${destination}" 1
+}
+
+verify_binary() {
+  local bin="$1" size header machine expected_machine
+
+  [[ -s "${bin}" ]] || die "Downloaded binary is empty."
+  [[ -x "${bin}" ]] || die "Downloaded binary is not executable."
+
+  size="$(wc -c < "${bin}" | tr -d '[:space:]')"
+  if [[ "${size}" -lt 1048576 ]]; then
+    die "Downloaded file is too small to be a valid node binary."
+  fi
+
+  if ! command -v od >/dev/null 2>&1; then
+    warn "Cannot find od; skipped ELF architecture verification."
+    return 0
+  fi
+
+  header="$(od -An -tx1 -N20 "${bin}" | tr -d '[:space:]')"
+  [[ "${header:0:8}" == "7f454c46" ]] || die "Downloaded file is not a Linux ELF binary."
+
+  case "${ARCH}" in
+    amd64) expected_machine="3e00" ;;
+    arm64) expected_machine="b700" ;;
+    armv6|armv7) expected_machine="2800" ;;
+    *) expected_machine="" ;;
+  esac
+
+  machine="${header:36:4}"
+  if [[ -n "${expected_machine}" && "${machine}" != "${expected_machine}" ]]; then
+    die "Downloaded binary architecture mismatch. Expected ${ARCH}, got ELF machine 0x${machine}."
+  fi
+
+  log "Binary verification passed."
+}
+
+setup_logging() {
+  mkdir -p "${LOG_DIR}"
+  touch "${LOG_FILE}"
+  chmod 755 "${LOG_DIR}"
+  chmod 640 "${LOG_FILE}"
+
+  cat > "${LOGROTATE_FILE}" <<EOF
+${LOG_FILE} {
+    size 50M
+    rotate 0
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+}
+
+write_service() {
+  cat > "${SERVICE_FILE}" <<EOF
+[Unit]
+Description=Flux Panel Gost Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/${APP_NAME}
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:${LOG_FILE}
+StandardError=append:${LOG_FILE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+refresh_service() {
+  systemctl daemon-reload
+  systemctl enable --now "${APP_NAME}"
+}
+
+ensure_service_running() {
+  sleep 2
+  if systemctl is-active --quiet "${APP_NAME}"; then
+    log "Service is running."
+    return 0
+  fi
+
+  err "Service failed to start. Showing diagnostics:"
+  systemctl --no-pager --full status "${APP_NAME}" || true
+  if [[ -f "${LOG_FILE}" ]]; then
+    tail -n 80 "${LOG_FILE}" || true
+  fi
+  exit 1
+}
+
+install_flow() {
+  detect_os
+  install_packages
+  prompt_config
+  resolve_binary_source
+
+  if systemctl list-unit-files --type=service | grep -Fq "${APP_NAME}.service"; then
+    stop_service
+    disable_service
+  fi
+
+  setup_logging
+  write_config
+  download_binary
+  write_service
+  refresh_service
+  ensure_service_running
+
+  log "Install complete."
+}
+
+update_flow() {
+  detect_os
+  install_packages
+
+  [[ -d "${INSTALL_DIR}" ]] || die "The node is not installed."
+  [[ -x "${INSTALL_DIR}/${APP_NAME}" ]] || die "Binary not found in ${INSTALL_DIR}."
+
+  if [[ -n "${SERVER_ADDR}" || -n "${SECRET}" ]]; then
+    prompt_config
+    write_config
+  elif [[ ! -f "${INSTALL_DIR}/config.json" ]]; then
+    prompt_config
+    write_config
+  fi
+
+  resolve_binary_source
+
+  setup_logging
+  stop_service
+  download_binary
+  write_service
+  refresh_service
+  ensure_service_running
+
+  log "Update complete."
+}
+
+uninstall_flow() {
+  detect_os
+  install_packages
+
+  if ! confirm "Remove the node, its config, logs, and service file?"; then
+    log "Cancelled."
+    return 0
+  fi
+
+  stop_service
+  disable_service
+  rm -f "${SERVICE_FILE}"
+  rm -f "${LOGROTATE_FILE}"
+  rm -rf "${INSTALL_DIR}"
+  rm -rf "${LOG_DIR}"
+  systemctl daemon-reload
+
+  log "Uninstall complete."
+}
+
+status_flow() {
+  detect_os
+  if [[ -f "${SERVICE_FILE}" ]]; then
+    systemctl --no-pager --full status "${APP_NAME}" || true
+  else
+    warn "Service file not found."
+  fi
+}
+
+logs_flow() {
+  detect_os
+  if [[ -f "${LOG_FILE}" ]]; then
+    tail -n 200 -F "${LOG_FILE}"
+  else
+    journalctl -u "${APP_NAME}" -f --no-pager
+  fi
+}
+
+show_menu() {
+  cat <<EOF
+===============================================
+              ${APP_NAME} manager
+===============================================
+1. Install / reinstall
+2. Update
+3. Uninstall
+4. Status
+5. Logs
+0. Exit
+===============================================
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      install|update|uninstall|status|logs|menu)
+        ACTION="$1"
+        shift
+        ;;
+      -a|--addr)
+        [[ $# -ge 2 ]] || die "$1 requires a value."
+        SERVER_ADDR="${2:-}"
+        shift 2
+        ;;
+      -s|--secret)
+        [[ $# -ge 2 ]] || die "$1 requires a value."
+        SECRET="${2:-}"
+        shift 2
+        ;;
+      -b|--binary-base-url)
+        [[ $# -ge 2 ]] || die "$1 requires a value."
+        BINARY_BASE_URL="${2:-}"
+        shift 2
+        ;;
+      -f|--fallback-binary-base-url)
+        [[ $# -ge 2 ]] || die "$1 requires a value."
+        BINARY_FALLBACK_BASE_URL="${2:-}"
+        shift 2
+        ;;
+      -y|--yes)
+        ASSUME_YES=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if [[ -z "${ACTION}" && ( -n "${SERVER_ADDR}" || -n "${SECRET}" ) ]]; then
+    ACTION="install"
+  fi
+
+  ACTION="${ACTION:-menu}"
+}
+
+main() {
+  ensure_root "$@"
+  parse_args "$@"
+
+  case "${ACTION}" in
+    install) install_flow ;;
+    update) update_flow ;;
+    uninstall) uninstall_flow ;;
+    status) status_flow ;;
+    logs) logs_flow ;;
+    menu)
+      while true; do
+        show_menu
+        read -r -p "Choose [0-5]: " choice
+        case "${choice}" in
+          1) install_flow; break ;;
+          2) update_flow; break ;;
+          3) uninstall_flow; break ;;
+          4) status_flow ;;
+          5) logs_flow ;;
+          0) exit 0 ;;
+          *) echo "Invalid choice." ;;
+        esac
+      done
+      ;;
+  esac
+}
+
+main "$@"
