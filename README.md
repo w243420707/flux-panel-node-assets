@@ -26,7 +26,18 @@ curl -L https://raw.githubusercontent.com/w243420707/flux-panel-node-assets/refs
 - `https://raw.githubusercontent.com/w243420707/flux-panel-node-assets/refs/heads/main/releases/gost-linux-armv7`
 - `https://raw.githubusercontent.com/w243420707/flux-panel-node-assets/refs/heads/main/releases/gost-linux-armv6`
 
+## 双仓库维护规则
+
+- 本仓库与 `w243420707/flux-panel_rev` 配套使用。
+- 只要涉及节点端安装脚本、更新逻辑、通信协议或节点二进制修改，必须同步更新主仓库和本仓库。
+- `install.sh`、四种架构二进制和 `SHA256SUMS` 必须保持同一版本，并在发布前完成校验。
+- 面板专属功能可以只更新主仓库；节点资源不能只留在主仓库。
+
 ## 更新日志
+
+### 1.0.1 - 2026-08-22
+
+- 增加双仓库同步维护规则，避免节点端修改只更新主仓库。
 
 ### 1.0.0 - 2026-08-22
 
