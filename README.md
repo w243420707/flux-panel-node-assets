@@ -36,6 +36,12 @@ curl -L https://raw.githubusercontent.com/w243420707/flux-panel-node-assets/refs
 
 ## 更新日志
 
+### 1.0.6 - 2026-09-20
+
+- 节点二进制版本更新到 `3.1.6`，支持面板的手动与定时 VPS 重启指令。
+- 复用加密 WebSocket，先发送接收回执，再执行固定的 `systemctl reboot`；不接受任意 shell 命令或参数，执行失败会回报面板。
+- 限 root 运行、systemd 管理的 Linux VPS；容器内节点不支持重启宿主机。四种架构二进制与校验文件同步更新。
+
 ### 1.0.5 - 2026-08-30
 
 - 节点上报内存已用和总量，面板可显示实际占用量，例如 `812M / 2G`。
